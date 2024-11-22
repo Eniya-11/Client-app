@@ -1,0 +1,111 @@
+from flask import Flask, request, jsonify
+import imaplib
+import email
+from email.header import decode_header
+import os
+import json
+import pickle
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.naive_bayes import MultinomialNB
+
+app = Flask(__name__)
+
+# Load or create the classifier
+classifier = None
+if os.path.exists('classifier.pkl'):
+    with open('classifier.pkl', 'rb') as f:
+        classifier = pickle.load(f)
+else:
+    classifier = MultinomialNB()
+
+# Initialize Vectorizer
+vectorizer = TfidfVectorizer(stop_words='english')
+
+# Email Configuration
+IMAP_SERVER = 'imap.gmail.com'
+EMAIL_ACCOUNT = 'your-email@gmail.com'
+PASSWORD = 'your-password'
+
+def get_email_data():
+    # Connect to Gmail server
+    mail = imaplib.IMAP4_SSL(IMAP_SERVER)
+    mail.login(EMAIL_ACCOUNT, PASSWORD)
+    mail.select('inbox')
+
+    status, messages = mail.search(None, 'ALL')
+    email_ids = messages[0].split()
+    
+    emails = []
+    for email_id in email_ids[-10:]:  # Retrieve the last 10 emails
+        status, msg_data = mail.fetch(email_id, '(RFC822)')
+        for response_part in msg_data:
+            if isinstance(response_part, tuple):
+                msg = email.message_from_bytes(response_part[1])
+                subject, encoding = decode_header(msg["Subject"])[0]
+                if isinstance(subject, bytes):
+                    subject = subject.decode(encoding if encoding else 'utf-8')
+                from_ = msg.get("From")
+                body = get_body(msg)
+                emails.append({'subject': subject, 'from': from_, 'body': body})
+    return emails
+
+def get_body(msg):
+    if msg.is_multipart():
+        for part in msg.walk():
+            if part.get_content_type() == "text/plain":
+                return part.get_payload(decode=True).decode()
+    else:
+        return msg.get_payload(decode=True).decode()
+
+# Train a simple classifier for email categorization
+def train_classifier():
+    # Example training data - In a real app, this would be dynamic and much larger
+    data = [
+        ("This is a work-related email", "work"),
+        ("Great deals for you", "promotion"),
+        ("Let's schedule a meeting", "work"),
+        ("Free vacation tickets", "promotion")
+    ]
+    labels = [x[1] for x in data]
+    texts = [x[0] for x in data]
+
+    # Convert the text data to TF-IDF
+    tfidf_matrix = vectorizer.fit_transform(texts)
+
+    classifier.fit(tfidf_matrix, labels)
+
+    # Save the classifier for future use
+    with open('classifier.pkl', 'wb') as f:
+        pickle.dump(classifier, f)
+
+@app.route('/emails', methods=['GET'])
+def get_emails():
+    emails = get_email_data()
+    
+    # Classify emails
+    for email in emails:
+        email_text = email['body']
+        email_tfidf = vectorizer.transform([email_text])
+        category = classifier.predict(email_tfidf)
+        email['category'] = category[0]
+    
+    return jsonify(emails)
+
+@app.route('/train', methods=['POST'])
+def train():
+    data = request.json
+    texts = data['texts']
+    labels = data['labels']
+    
+    # Train the classifier with the provided data
+    tfidf_matrix = vectorizer.fit_transform(texts)
+    classifier.fit(tfidf_matrix, labels)
+
+    # Save the updated model
+    with open('classifier.pkl', 'wb') as f:
+        pickle.dump(classifier, f)
+
+    return jsonify({"message": "Classifier trained successfully!"})
+
+if __name__ == '__main__':
+    app.run(debug=True)
